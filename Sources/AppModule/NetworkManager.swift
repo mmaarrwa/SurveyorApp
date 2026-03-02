@@ -23,8 +23,14 @@ final class NetworkManager {
             switch state {
             case .ready:
                 print("Connected to \(ipAddress)")
+                
+                // 📡 NEW: Send a handshake packet to punch the UDP hole
+                // This tells the laptop what ephemeral port the iPhone is actually using!
+                self?.sendPose(["type": "handshake", "message": "iOS Ready"])
+                
                 // Once connected, start listening for data from the Laptop
                 self?.receiveIncomingData()
+                
             case .failed(let error):
                 print("Connection failed: \(error)")
             default:
@@ -45,7 +51,6 @@ final class NetworkManager {
         connection?.send(content: data, completion: .contentProcessed({ _ in }))
     }
     
-    // MARK: - Missing Function Added
     // This listens for "START" or "STOP" from the laptop
     private func receiveIncomingData() {
         connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] (data, _, isComplete, error) in

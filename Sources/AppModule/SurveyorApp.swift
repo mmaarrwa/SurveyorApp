@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct ARKitRobotApp: App {
+struct SurveyorApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

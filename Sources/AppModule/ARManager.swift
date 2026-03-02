@@ -2,6 +2,8 @@ import Foundation
 import ARKit
 import SceneKit
 import simd
+import Vision
+import CoreML
 
 final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     static let shared = ARManager()
@@ -14,14 +16,22 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     }()
 
     @Published var isStreaming: Bool = false
-    @Published var statusText: String = "Idle"
-    @Published var serverIP: String = "192.168.1.10"
+    @Published var statusText: String = "Ready. Enter IP & Connect."
+    @Published var serverIP: String = "172.20.10.3" //ip when cconnected to my phone hotspot, momken ya5talef 3ady 
+    
+    // NEW: User Input for Camera Height
+    @Published var cameraHeightInput: String = "0.20"
+    
+    // Computed property to safely convert the text input into a Float
+    var robotCameraHeight: Float {
+        return Float(cameraHeightInput) ?? 0.20
+    }
 
     private let network = NetworkManager.shared
 
-    // --- Configurable parameters ---
-    private let rayGridSize = 5            // 5x5 Grid
-    private let rayScreenRadius: CGFloat = 0.15 // Slightly wider scan
+    // --- Configurable parameters for General Collision ---
+    private let rayGridSize = 5            
+    private let rayScreenRadius: CGFloat = 0.15 
     private let maxRayDistance: Float = 3.0
     private let minRayDistance: Float = 0.15
     
@@ -34,34 +44,67 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     private let densityFallbackMinDistance: Float = 0.4
 
     // --- Smoothing & Confidence ---
-    private var smoothedObstacleDist: Float = 10.0 // Initialize with "far"
-    private let smoothingAlpha: Float = 0.2 // 0.2 = Slow/Smooth, 0.8 = Fast/Jittery
+    private var smoothedObstacleDist: Float = 10.0 
+    private let smoothingAlpha: Float = 0.2 
 
-    // --- Surveying Logic ---
-    private var lastSurveyPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
-    private let surveyInterval: Float = 2.0 // Meters required to trigger a survey packet
+    // --- YOLO AI Variables ---
+    private var visionModel: VNCoreMLModel?
+    private var visionRequest: VNCoreMLRequest?
+    private var isProcessingFrame = false
 
     override init() {
         super.init()
+        setupYOLO()
         network.onCommandReceived = { [weak self] command in
             self?.handleRemoteCommand(command)
+        }
+    }
+
+    private func setupYOLO() {
+        // Look for the compiled model (CoreML compiles .mlpackage into .mlmodelc)
+        guard let modelURL = Bundle.main.url(forResource: "yolo26n", withExtension: "mlmodelc") else {
+            print("❌ YOLO model not found in app bundle!")
+            return
+        }
+        
+        do {
+            let coreMLModel = try MLModel(contentsOf: modelURL)
+            visionModel = try VNCoreMLModel(for: coreMLModel)
+            
+            visionRequest = VNCoreMLRequest(model: visionModel!) { [weak self] request, error in
+                // Handled in session(didUpdate:) to pass the ARFrame
+            }
+            
+            visionRequest?.imageCropAndScaleOption = .scaleFill
+            print("✅ YOLO Model Loaded Successfully!")
+        } catch {
+            print("❌ Failed to load Vision ML model: \(error)")
         }
     }
 
     func startSessionIfNeeded() {
         guard ARWorldTrackingConfiguration.isSupported else { return }
         let config = ARWorldTrackingConfiguration()
-        config.worldAlignment = .gravity
+        // 🛡️ DISABLED COMPASS: This prevents the motors' EMI from twisting the trajectory
+        config.worldAlignment = .gravity 
         sceneView.session.run(config)
         sceneView.session.delegate = self
-        statusText = "Ready to Connect"
+    }
+
+    // NEW: Connects to WiFi but DOES NOT start the camera yet
+    func connectToNetwork() {
+        network.start(ipAddress: serverIP)
+        statusText = "Connected. Waiting for START..."
     }
 
     func handleRemoteCommand(_ command: String) {
-        if command == "START" {
-            if !isStreaming { toggleStreaming() }
-        } else if command == "STOP" {
-            if isStreaming { toggleStreaming() }
+        // Clean the incoming text just in case Python sends hidden newline characters
+        let cleanCommand = command.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        
+        if cleanCommand == "START" && !isStreaming {
+            DispatchQueue.main.async { self.toggleStreaming() }
+        } else if cleanCommand == "STOP" && isStreaming {
+            DispatchQueue.main.async { self.toggleStreaming() }
         }
     }
 
@@ -69,19 +112,17 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         isStreaming.toggle()
 
         if isStreaming {
-            statusText = "Streaming..."
-            smoothedObstacleDist = 10.0 // Reset smoothing on start
-            lastSurveyPosition = SIMD3<Float>(0,0,0) // Reset survey logic
+            statusText = "Streaming & Detecting..."
+            smoothedObstacleDist = 10.0 
             
-            network.start(ipAddress: serverIP)
-
             let config = ARWorldTrackingConfiguration()
-            config.worldAlignment = .gravity
+            config.worldAlignment = .gravity // Ensure it stays disabled on restart
             sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
         } else {
             statusText = "Stopped"
-            network.stop()
+            // Pause the camera to save battery
+            sceneView.session.pause()
         }
     }
 
@@ -95,7 +136,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         let currentPos = SIMD3<Float>(col3.x, col3.y, col3.z)
         let q = simd_quatf(cameraTransform)
 
-        // 2. Calculate Obstacle Distance (Hybrid: HitTest + Smoothing)
+        // 2. Calculate general frontal obstacle distance (For safety/walls)
         let obstacleDistance = detectObstacleDistance(frame: frame)
 
         // ---------------------------------------------------------
@@ -111,45 +152,119 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         network.sendPose(navPacket)
 
         // ---------------------------------------------------------
-        // PACKET 2: SURVEYING (Sent Every 2 Meters)
+        // PACKET 2: YOLO OBJECT DETECTION & XYZ MAPPING
         // ---------------------------------------------------------
-        let distMoved = distance(currentPos, lastSurveyPosition)
-
-        if distMoved >= surveyInterval {
-            // Create survey data
-            let surveyPacket: [String: Any] = [
-                "type": "survey",
-                "timestamp": frame.timestamp,
-                "position": [currentPos.x, currentPos.y, currentPos.z],
-                "label": "Survey Point", // You can replace this later with ML detection
-                "note": "Captured at \(String(format: "%.2f", distMoved))m interval"
-            ]
+        if !isProcessingFrame, let request = visionRequest {
+            isProcessingFrame = true
+            let pixelBuffer = frame.capturedImage
             
-            network.sendPose(surveyPacket)
-            
-            // Reset tracker
-            lastSurveyPosition = currentPos
-            print("📍 Survey Packet Sent at: \(currentPos)")
+            DispatchQueue.global(qos: .userInitiated).async {
+                // ARKit frames are rotated 90 degrees natively, .right fixes it
+                let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+                do {
+                    try handler.perform([request])
+                    self.processYOLOResults(request: request, frame: frame, currentPos: currentPos)
+                } catch {
+                    print("❌ YOLO Execution Error: \(error)")
+                    self.isProcessingFrame = false
+                }
+            }
         }
     }
 
-    // MARK: - Obstacle detection helpers
+    // MARK: - Process AI & 3D Math
+    private func processYOLOResults(request: VNRequest, frame: ARFrame, currentPos: SIMD3<Float>) {
+        defer { isProcessingFrame = false }
+        
+        guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
+        
+        for observation in results {
+            guard let topLabel = observation.labels.first else { continue }
+            
+            // Only map the object if YOLO is confident
+            if topLabel.confidence > 0.60 {
+                
+                let bbox = observation.boundingBox
+                
+                // 1. Calculate Ground Contact Point
+                // Vision coords: (0,0) is bottom-left. ARKit coords: (0,0) is top-left.
+                let arKitCenter = CGPoint(x: bbox.midX, y: 1.0 - bbox.minY) 
+                
+                var finalObjPos: SIMD3<Float>? = nil
+                
+                // --- STAGE 1: Try ARKit Ray-cast (HitTest) ---
+                let hitTestResults = frame.hitTest(arKitCenter, types: [.featurePoint, .estimatedHorizontalPlane])
+                
+                if let hit = hitTestResults.first {
+                    finalObjPos = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                                               hit.worldTransform.columns.3.y,
+                                               hit.worldTransform.columns.3.z)
+                    print("🎯 \(topLabel.identifier) mapped via 3D Point Cloud")
+                } 
+                // --- STAGE 2: Geometric Math Fallback ---
+                else {
+                    let intrinsics = frame.camera.intrinsics
+                    let fx = intrinsics[0][0]; let fy = intrinsics[1][1]
+                    let cx = intrinsics[2][0]; let cy = intrinsics[2][1]
+                    
+                    let imageRes = frame.camera.imageResolution
+                    let ub = Float(arKitCenter.x * imageRes.width)
+                    let vb = Float(arKitCenter.y * imageRes.height)
+                    
+                    // Normalized image coordinates
+                    let xn = (ub - cx) / fx
+                    let yn = (vb - cy) / fy
+                    let rc = simd_float3(xn, yn, 1.0)
+                    
+                    // Transform ray to world frame
+                    let cameraTransform = frame.camera.transform
+                    let R = simd_float3x3(
+                        simd_float3(cameraTransform.columns.0.x, cameraTransform.columns.0.y, cameraTransform.columns.0.z),
+                        simd_float3(cameraTransform.columns.1.x, cameraTransform.columns.1.y, cameraTransform.columns.1.z),
+                        simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+                    )
+                    
+                    let rw = R * rc
+                    
+                    // Ray-Ground Intersection (Assuming floor is at -robotCameraHeight)
+                    if rw.y < -0.001 { // Ensure ray is pointing downward
+                        let t = -robotCameraHeight / rw.y
+                        let objX = currentPos.x + (t * rw.x)
+                        let objZ = currentPos.z + (t * rw.z)
+                        let objY = currentPos.y - robotCameraHeight 
+                        
+                        finalObjPos = SIMD3<Float>(objX, objY, objZ)
+                        print("🧮 \(topLabel.identifier) mapped via Geometric Fallback")
+                    }
+                }
+                
+                // --- SEND THE DATA ---
+                if let objPos = finalObjPos {
+                    let distToObject = distance(currentPos, objPos)
+                    
+                    let detectionPacket: [String: Any] = [
+                        "type": "survey", // Acts as the obstacle packet for the Python script
+                        "timestamp": frame.timestamp,
+                        "position": [objPos.x, objPos.y, objPos.z],
+                        "label": topLabel.identifier,
+                        "note": "Dist: \(String(format: "%.2f", distToObject))m"
+                    ]
+                    
+                    network.sendPose(detectionPacket)
+                }
+            }
+        }
+    }
 
+    // MARK: - General Obstacle detection helpers
     private func detectObstacleDistance(frame: ARFrame) -> Float {
-        var rawDistance: Float = 10.0 // Default: No obstacle
-
-        // 1) Priority: Grid Hit Test (High Confidence)
+        var rawDistance: Float = 10.0 
         if let hitDist = performGridHitTest(cameraTransform: frame.camera.transform) {
             rawDistance = hitDist
-        } 
-        // 2) Fallback: Feature Point Density (Medium Confidence)
-        else if let densityDist = featurePointDensityFallback(frame: frame) {
+        } else if let densityDist = featurePointDensityFallback(frame: frame) {
             rawDistance = densityDist
         }
-
-        // 3) Apply Exponential Weighted Moving Average (EWMA) Smoothing
         smoothedObstacleDist = (smoothingAlpha * rawDistance) + ((1.0 - smoothingAlpha) * smoothedObstacleDist)
-        
         return smoothedObstacleDist
     }
 
@@ -159,7 +274,6 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let minSide = min(bounds.width, bounds.height)
         let radiusPx = rayScreenRadius * minSide
-
         let camPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
         
         var nearestDistance: Float? = nil
@@ -171,43 +285,27 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
             for j in 0..<rayGridSize {
                 let nx = CGFloat(i - half) / CGFloat(max(1, half))
                 let ny = CGFloat(j - half) / CGFloat(max(1, half))
-
-                let samplePoint = CGPoint(x: center.x + nx * radiusPx,
-                                          y: center.y + ny * radiusPx)
-
+                let samplePoint = CGPoint(x: center.x + nx * radiusPx, y: center.y + ny * radiusPx)
                 let results = view.hitTest(samplePoint, types: [.featurePoint, .existingPlaneUsingExtent, .estimatedHorizontalPlane])
                 
                 if let hit = results.first {
-                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
-                                              hit.worldTransform.columns.3.y, 
-                                              hit.worldTransform.columns.3.z)
-                    
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, hit.worldTransform.columns.3.y, hit.worldTransform.columns.3.z)
                     let d = distance(camPos, hitPos)
-                    
                     if d >= minRayDistance && d <= maxRayDistance {
                         hitCount += 1
-                        if let current = nearestDistance {
-                            nearestDistance = min(current, d)
-                        } else {
-                            nearestDistance = d
-                        }
+                        if let current = nearestDistance { nearestDistance = min(current, d) } else { nearestDistance = d }
                     }
                 }
             }
         }
-
-        if hitCount >= requiredHits {
-            return nearestDistance
-        }
+        if hitCount >= requiredHits { return nearestDistance }
         return nil
     }
 
     private func featurePointDensityFallback(frame: ARFrame) -> Float? {
         guard let points = frame.rawFeaturePoints?.points else { return nil }
-
         let cameraTransform = frame.camera.transform
         let worldToCamera = cameraTransform.inverse
-
         var count = 0
         var nearestZ: Float? = nil
 
@@ -218,21 +316,12 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
             if local.z < featurePointNearZ && local.z > featurePointFarZ {
                 if abs(local.x) <= featurePointConeHalfWidth && abs(local.y) <= featurePointConeHalfHeight {
                     count += 1
-                    if nearestZ == nil || abs(local.z) < nearestZ! {
-                        nearestZ = abs(local.z)
-                    }
+                    if nearestZ == nil || abs(local.z) < nearestZ! { nearestZ = abs(local.z) }
                 }
             }
         }
-
         if count >= featurePointDensityThreshold {
-            if let nz = nearestZ {
-                return max(minRayDistance, min(maxRayDistance, nz))
-            } else {
-                return densityFallbackMinDistance
-            }
-        } else {
-            return nil
-        }
+            if let nz = nearestZ { return max(minRayDistance, min(maxRayDistance, nz)) } else { return densityFallbackMinDistance }
+        } else { return nil }
     }
 }

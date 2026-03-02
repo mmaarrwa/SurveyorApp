@@ -4,13 +4,13 @@ import PackageDescription
 // We removed 'import AppleProductTypes' which caused the error
 
 let package = Package(
-    name: "ARKitRobotApp",
+    name: "SurveyorApp",
     platforms: [.iOS("16.0")],
     products: [
         // We changed '.iOSApplication' to '.executable'
         // This is the standard way to define an app in SPM
         .executable(
-            name: "ARKitRobotApp",
+            name: "SurveyorApp",
             targets: ["AppModule"]
         )
     ],
@@ -21,7 +21,8 @@ let package = Package(
             // This is new: We must manually link the Info.plist file
             // so the build system can find the camera permission, etc.
             resources: [
-                .process("../Info.plist")
+                .process("../Info.plist"),
+                .process("yolo26n.mlpackage") //adding the model 
             ]
         )
     ]
