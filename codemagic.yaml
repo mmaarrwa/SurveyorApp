@@ -6,11 +6,12 @@ workflows:
     scripts:
       - name: Build archive
         script: |
-          # Build the executable
+          # Build the executable and force CoreML to use Swift
           xcodebuild archive \
             -scheme "SurveyorApp" \
             -archivePath "$CM_BUILD_DIR/SurveyorApp.xcarchive" \
-            -destination "generic/platform=iOS"
+            -destination "generic/platform=iOS" \
+            COREML_CODEGEN_LANGUAGE=Swift
 
       - name: Construct Manual .ipa
         script: |
