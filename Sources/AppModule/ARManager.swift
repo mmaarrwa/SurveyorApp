@@ -54,6 +54,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
     override init() {
         super.init()
+        sceneView.session.delegate = self
         setupYOLO()
         network.onCommandReceived = { [weak self] command in
             self?.handleRemoteCommand(command)
