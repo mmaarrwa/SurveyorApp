@@ -17,25 +17,20 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
     @Published var isStreaming: Bool = false
     @Published var statusText: String = "Ready. Enter IP & Connect."
-    @Published var serverIP: String = "172.20.10.3" //ip when cconnected to my phone hotspot, momken ya5talef 3ady 
+    @Published var serverIP: String = "192.168.1.10"
     
-    // NEW: User Input for Camera Height
     @Published var cameraHeightInput: String = "0.20"
     
-    // Computed property to safely convert the text input into a Float
     var robotCameraHeight: Float {
         return Float(cameraHeightInput) ?? 0.20
     }
 
     private let network = NetworkManager.shared
 
-    // --- Configurable parameters for General Collision ---
     private let rayGridSize = 5            
     private let rayScreenRadius: CGFloat = 0.15 
     private let maxRayDistance: Float = 3.0
     private let minRayDistance: Float = 0.15
-    
-    // Feature Point Fallback Params
     private let featurePointConeHalfWidth: Float = 0.25
     private let featurePointConeHalfHeight: Float = 0.25
     private let featurePointNearZ: Float = -0.2
@@ -43,18 +38,18 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     private let featurePointDensityThreshold = 60
     private let densityFallbackMinDistance: Float = 0.4
 
-    // --- Smoothing & Confidence ---
     private var smoothedObstacleDist: Float = 10.0 
     private let smoothingAlpha: Float = 0.2 
 
-    // --- YOLO AI Variables ---
     private var visionModel: VNCoreMLModel?
     private var visionRequest: VNCoreMLRequest?
     private var isProcessingFrame = false
 
     override init() {
         super.init()
-        sceneView.session.delegate = self
+        // THE FIX: Ensure the camera feed reaches our code!
+        sceneView.session.delegate = self 
+        
         setupYOLO()
         network.onCommandReceived = { [weak self] command in
             self?.handleRemoteCommand(command)
@@ -62,7 +57,6 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func setupYOLO() {
-        // Look for the compiled model (CoreML compiles .mlpackage into .mlmodelc)
         guard let modelURL = Bundle.main.url(forResource: "yolo26n", withExtension: "mlmodelc") else {
             print("❌ YOLO model not found in app bundle!")
             return
@@ -71,11 +65,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         do {
             let coreMLModel = try MLModel(contentsOf: modelURL)
             visionModel = try VNCoreMLModel(for: coreMLModel)
-            
-            visionRequest = VNCoreMLRequest(model: visionModel!) { [weak self] request, error in
-                // Handled in session(didUpdate:) to pass the ARFrame
-            }
-            
+            visionRequest = VNCoreMLRequest(model: visionModel!) { request, error in }
             visionRequest?.imageCropAndScaleOption = .scaleFill
             print("✅ YOLO Model Loaded Successfully!")
         } catch {
@@ -86,20 +76,16 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     func startSessionIfNeeded() {
         guard ARWorldTrackingConfiguration.isSupported else { return }
         let config = ARWorldTrackingConfiguration()
-        // 🛡️ DISABLED COMPASS: This prevents the motors' EMI from twisting the trajectory
         config.worldAlignment = .gravity 
         sceneView.session.run(config)
-        sceneView.session.delegate = self
     }
 
-    // NEW: Connects to WiFi but DOES NOT start the camera yet
     func connectToNetwork() {
         network.start(ipAddress: serverIP)
         statusText = "Connected. Waiting for START..."
     }
 
     func handleRemoteCommand(_ command: String) {
-        // Clean the incoming text just in case Python sends hidden newline characters
         let cleanCommand = command.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         
         if cleanCommand == "START" && !isStreaming {
@@ -117,12 +103,10 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
             smoothedObstacleDist = 10.0 
             
             let config = ARWorldTrackingConfiguration()
-            config.worldAlignment = .gravity // Ensure it stays disabled on restart
+            config.worldAlignment = .gravity
             sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-
         } else {
             statusText = "Stopped"
-            // Pause the camera to save battery
             sceneView.session.pause()
         }
     }
@@ -131,18 +115,13 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isStreaming else { return }
 
-        // 1. Get Current Pose
         let cameraTransform = frame.camera.transform
         let col3 = cameraTransform.columns.3
         let currentPos = SIMD3<Float>(col3.x, col3.y, col3.z)
         let q = simd_quatf(cameraTransform)
 
-        // 2. Calculate general frontal obstacle distance (For safety/walls)
         let obstacleDistance = detectObstacleDistance(frame: frame)
 
-        // ---------------------------------------------------------
-        // PACKET 1: NAVIGATION (Sent Every Frame)
-        // ---------------------------------------------------------
         let navPacket: [String: Any] = [
             "type": "nav",
             "timestamp": frame.timestamp,
@@ -152,15 +131,11 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         ]
         network.sendPose(navPacket)
 
-        // ---------------------------------------------------------
-        // PACKET 2: YOLO OBJECT DETECTION & XYZ MAPPING
-        // ---------------------------------------------------------
         if !isProcessingFrame, let request = visionRequest {
             isProcessingFrame = true
             let pixelBuffer = frame.capturedImage
             
             DispatchQueue.global(qos: .userInitiated).async {
-                // ARKit frames are rotated 90 degrees natively, .right fixes it
                 let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
                 do {
                     try handler.perform([request])
@@ -177,33 +152,28 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     private func processYOLOResults(request: VNRequest, frame: ARFrame, currentPos: SIMD3<Float>) {
         defer { isProcessingFrame = false }
         
-        guard let results = request.results as? [VNRecognizedObjectObservation] else { return }
+        // THE FIX: Safety net for NMS export
+        guard let results = request.results as? [VNRecognizedObjectObservation] else { 
+            print("⚠️ YOLO output is NOT Bounding Boxes! Format: \(String(describing: request.results?.first))")
+            return 
+        }
         
         for observation in results {
             guard let topLabel = observation.labels.first else { continue }
             
-            // Only map the object if YOLO is confident
             if topLabel.confidence > 0.60 {
-                
                 let bbox = observation.boundingBox
-                
-                // 1. Calculate Ground Contact Point
-                // Vision coords: (0,0) is bottom-left. ARKit coords: (0,0) is top-left.
                 let arKitCenter = CGPoint(x: bbox.midX, y: 1.0 - bbox.minY) 
                 
                 var finalObjPos: SIMD3<Float>? = nil
                 
-                // --- STAGE 1: Try ARKit Ray-cast (HitTest) ---
                 let hitTestResults = frame.hitTest(arKitCenter, types: [.featurePoint, .estimatedHorizontalPlane])
                 
                 if let hit = hitTestResults.first {
                     finalObjPos = SIMD3<Float>(hit.worldTransform.columns.3.x,
                                                hit.worldTransform.columns.3.y,
                                                hit.worldTransform.columns.3.z)
-                    print("🎯 \(topLabel.identifier) mapped via 3D Point Cloud")
-                } 
-                // --- STAGE 2: Geometric Math Fallback ---
-                else {
+                } else {
                     let intrinsics = frame.camera.intrinsics
                     let fx = intrinsics[0][0]; let fy = intrinsics[1][1]
                     let cx = intrinsics[2][0]; let cy = intrinsics[2][1]
@@ -212,12 +182,10 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
                     let ub = Float(arKitCenter.x * imageRes.width)
                     let vb = Float(arKitCenter.y * imageRes.height)
                     
-                    // Normalized image coordinates
                     let xn = (ub - cx) / fx
                     let yn = (vb - cy) / fy
                     let rc = simd_float3(xn, yn, 1.0)
                     
-                    // Transform ray to world frame
                     let cameraTransform = frame.camera.transform
                     let R = simd_float3x3(
                         simd_float3(cameraTransform.columns.0.x, cameraTransform.columns.0.y, cameraTransform.columns.0.z),
@@ -227,33 +195,65 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
                     
                     let rw = R * rc
                     
-                    // Ray-Ground Intersection (Assuming floor is at -robotCameraHeight)
-                    if rw.y < -0.001 { // Ensure ray is pointing downward
+                    if rw.y < -0.001 {
                         let t = -robotCameraHeight / rw.y
                         let objX = currentPos.x + (t * rw.x)
                         let objZ = currentPos.z + (t * rw.z)
                         let objY = currentPos.y - robotCameraHeight 
                         
                         finalObjPos = SIMD3<Float>(objX, objY, objZ)
-                        print("🧮 \(topLabel.identifier) mapped via Geometric Fallback")
                     }
                 }
                 
-                // --- SEND THE DATA ---
                 if let objPos = finalObjPos {
                     let distToObject = distance(currentPos, objPos)
+                    let formattedDist = String(format: "%.2f", distToObject)
+                    
+                    // --- NEW: SHOW FLOATING 3D LABEL ---
+                    let labelText = "\(topLabel.identifier): \(formattedDist)m"
+                    self.add3DLabel(text: labelText, position: objPos)
                     
                     let detectionPacket: [String: Any] = [
-                        "type": "survey", // Acts as the obstacle packet for the Python script
+                        "type": "survey",
                         "timestamp": frame.timestamp,
                         "position": [objPos.x, objPos.y, objPos.z],
                         "label": topLabel.identifier,
-                        "note": "Dist: \(String(format: "%.2f", distToObject))m"
+                        "note": "Dist: \(formattedDist)m"
                     ]
                     
                     network.sendPose(detectionPacket)
                 }
             }
+        }
+    }
+
+    // --- NEW: 3D AR LABEL FUNCTION ---
+    private func add3DLabel(text: String, position: SIMD3<Float>) {
+        DispatchQueue.main.async {
+            // Create 3D text
+            let textGeometry = SCNText(string: text, extrusionDepth: 0.01)
+            textGeometry.font = UIFont.systemFont(ofSize: 1.0)
+            textGeometry.firstMaterial?.diffuse.contents = UIColor.green
+            
+            let textNode = SCNNode(geometry: textGeometry)
+            
+            // Scale it down to look normal in AR (5% of original size)
+            textNode.scale = SCNVector3(0.05, 0.05, 0.05)
+            
+            // Position it 20cm above the object's hit point
+            textNode.position = SCNVector3(position.x, position.y + 0.20, position.z)
+            
+            // Force the text to always face the camera
+            let billboardConstraint = SCNBillboardConstraint()
+            billboardConstraint.freeAxes = .Y
+            textNode.constraints = [billboardConstraint]
+            
+            self.sceneView.scene.rootNode.addChildNode(textNode)
+            
+            // Fade out and remove after 2 seconds to avoid screen clutter
+            let fadeOut = SCNAction.fadeOut(duration: 2.0)
+            let remove = SCNAction.removeFromParentNode()
+            textNode.runAction(SCNAction.sequence([fadeOut, remove]))
         }
     }
 

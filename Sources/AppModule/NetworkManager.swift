@@ -64,17 +64,12 @@ final class NetworkManager {
             if let data = data, !data.isEmpty, let message = String(data: data, encoding: .utf8) {
                 print("Received command: \(message)")
                 DispatchQueue.main.async {
-                    // Clean up the string (remove newlines) and notify ARManager
                     self.onCommandReceived?(message.trimmingCharacters(in: .whitespacesAndNewlines))
                 }
             }
             
-            if isComplete {
-                print("Connection closed by remote")
-            } else {
-                // Keep listening for the next command
-                self.receiveIncomingData()
-            }
+            // THE FIX: Always call this function again so it never goes deaf!
+            self.receiveIncomingData() 
         }
     }
 }
