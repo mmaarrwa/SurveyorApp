@@ -149,80 +149,84 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     // MARK: - Process AI & 3D Math
+    // MARK: - Process AI & 3D Math (UNFILTERED FIREHOSE MODE)
     private func processYOLOResults(request: VNRequest, frame: ARFrame, currentPos: SIMD3<Float>) {
         defer { isProcessingFrame = false }
         
-        // THE FIX: Safety net for NMS export
         guard let results = request.results as? [VNRecognizedObjectObservation] else { 
-            print("⚠️ YOLO output is NOT Bounding Boxes! Format: \(String(describing: request.results?.first))")
+            network.sendLog("⚠️ YOLO ERROR: Output is NOT Bounding Boxes! Check Colab export.")
             return 
         }
         
+        // This loop automatically handles MULTIPLE objects detected in the same frame!
         for observation in results {
             guard let topLabel = observation.labels.first else { continue }
             
-            if topLabel.confidence > 0.60 {
-                let bbox = observation.boundingBox
-                let arKitCenter = CGPoint(x: bbox.midX, y: 1.0 - bbox.minY) 
+            // 🚨 WE COMPLETELY DELETED THE CONFIDENCE FILTER! 🚨
+            // It will now process EVERYTHING it sees, even if it is only 1% confident.
+            
+            let confPct = Int(topLabel.confidence * 100)
+            network.sendLog("👀 YOLO sees: \(topLabel.identifier) (\(confPct)%)")
+            
+            let bbox = observation.boundingBox
+            let arKitCenter = CGPoint(x: bbox.midX, y: 1.0 - bbox.minY) 
+            var finalObjPos: SIMD3<Float>? = nil
+            
+            let hitTestResults = frame.hitTest(arKitCenter, types: [.featurePoint, .estimatedHorizontalPlane])
+            
+            if let hit = hitTestResults.first {
+                finalObjPos = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                                           hit.worldTransform.columns.3.y,
+                                           hit.worldTransform.columns.3.z)
+            } else {
+                let intrinsics = frame.camera.intrinsics
+                let fx = intrinsics[0][0]; let fy = intrinsics[1][1]
+                let cx = intrinsics[2][0]; let cy = intrinsics[2][1]
                 
-                var finalObjPos: SIMD3<Float>? = nil
+                let imageRes = frame.camera.imageResolution
+                let ub = Float(arKitCenter.x * imageRes.width)
+                let vb = Float(arKitCenter.y * imageRes.height)
                 
-                let hitTestResults = frame.hitTest(arKitCenter, types: [.featurePoint, .estimatedHorizontalPlane])
+                let xn = (ub - cx) / fx
+                let yn = (vb - cy) / fy
+                let rc = simd_float3(xn, yn, 1.0)
                 
-                if let hit = hitTestResults.first {
-                    finalObjPos = SIMD3<Float>(hit.worldTransform.columns.3.x,
-                                               hit.worldTransform.columns.3.y,
-                                               hit.worldTransform.columns.3.z)
+                let cameraTransform = frame.camera.transform
+                let R = simd_float3x3(
+                    simd_float3(cameraTransform.columns.0.x, cameraTransform.columns.0.y, cameraTransform.columns.0.z),
+                    simd_float3(cameraTransform.columns.1.x, cameraTransform.columns.1.y, cameraTransform.columns.1.z),
+                    simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
+                )
+                
+                let rw = R * rc
+                
+                if rw.y < -0.001 {
+                    let t = -robotCameraHeight / rw.y
+                    let objX = currentPos.x + (t * rw.x)
+                    let objZ = currentPos.z + (t * rw.z)
+                    let objY = currentPos.y - robotCameraHeight 
+                    finalObjPos = SIMD3<Float>(objX, objY, objZ)
                 } else {
-                    let intrinsics = frame.camera.intrinsics
-                    let fx = intrinsics[0][0]; let fy = intrinsics[1][1]
-                    let cx = intrinsics[2][0]; let cy = intrinsics[2][1]
-                    
-                    let imageRes = frame.camera.imageResolution
-                    let ub = Float(arKitCenter.x * imageRes.width)
-                    let vb = Float(arKitCenter.y * imageRes.height)
-                    
-                    let xn = (ub - cx) / fx
-                    let yn = (vb - cy) / fy
-                    let rc = simd_float3(xn, yn, 1.0)
-                    
-                    let cameraTransform = frame.camera.transform
-                    let R = simd_float3x3(
-                        simd_float3(cameraTransform.columns.0.x, cameraTransform.columns.0.y, cameraTransform.columns.0.z),
-                        simd_float3(cameraTransform.columns.1.x, cameraTransform.columns.1.y, cameraTransform.columns.1.z),
-                        simd_float3(cameraTransform.columns.2.x, cameraTransform.columns.2.y, cameraTransform.columns.2.z)
-                    )
-                    
-                    let rw = R * rc
-                    
-                    if rw.y < -0.001 {
-                        let t = -robotCameraHeight / rw.y
-                        let objX = currentPos.x + (t * rw.x)
-                        let objZ = currentPos.z + (t * rw.z)
-                        let objY = currentPos.y - robotCameraHeight 
-                        
-                        finalObjPos = SIMD3<Float>(objX, objY, objZ)
-                    }
+                    network.sendLog("⚠️ MATH FAIL: Ray pointing up for \(topLabel.identifier)")
                 }
+            }
+            
+            if let objPos = finalObjPos {
+                let distToObject = distance(currentPos, objPos)
+                let formattedDist = String(format: "%.2f", distToObject)
                 
-                if let objPos = finalObjPos {
-                    let distToObject = distance(currentPos, objPos)
-                    let formattedDist = String(format: "%.2f", distToObject)
-                    
-                    // --- NEW: SHOW FLOATING 3D LABEL ---
-                    let labelText = "\(topLabel.identifier): \(formattedDist)m"
-                    self.add3DLabel(text: labelText, position: objPos)
-                    
-                    let detectionPacket: [String: Any] = [
-                        "type": "survey",
-                        "timestamp": frame.timestamp,
-                        "position": [objPos.x, objPos.y, objPos.z],
-                        "label": topLabel.identifier,
-                        "note": "Dist: \(formattedDist)m"
-                    ]
-                    
-                    network.sendPose(detectionPacket)
-                }
+                // Add the confidence % to the floating 3D text!
+                self.add3DLabel(text: "\(topLabel.identifier): \(formattedDist)m (\(confPct)%)", position: objPos)
+                
+                let detectionPacket: [String: Any] = [
+                    "type": "survey",
+                    "timestamp": frame.timestamp,
+                    "position": [objPos.x, objPos.y, objPos.z],
+                    "label": topLabel.identifier,
+                    // Add the confidence % to the Python graph!
+                    "note": "Dist: \(formattedDist)m, Conf: \(confPct)%"
+                ]
+                network.sendPose(detectionPacket)
             }
         }
     }

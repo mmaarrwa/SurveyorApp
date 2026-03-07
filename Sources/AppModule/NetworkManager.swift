@@ -50,6 +50,15 @@ final class NetworkManager {
         guard let data = try? JSONSerialization.data(withJSONObject: pose, options: []) else { return }
         connection?.send(content: data, completion: .contentProcessed({ _ in }))
     }
+
+    // NEW: Remote logger to send iPhone console prints to your Python terminal!
+    func sendLog(_ message: String) {
+        let logPacket: [String: Any] = [
+            "type": "log",
+            "message": message
+        ]
+        sendPose(logPacket)
+    }
     
     // This listens for "START" or "STOP" from the laptop
     private func receiveIncomingData() {
