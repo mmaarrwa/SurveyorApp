@@ -45,7 +45,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func setupYOLO() {
-        guard let modelURL = Bundle.main.url(forResource: "yolo26n", withExtension: "mlmodelc") else {
+        guard let modelURL = Bundle.main.url(forResource: "yolov8n", withExtension: "mlmodelc") else {
             print("❌ YOLO model not found in app bundle!")
             return
         }

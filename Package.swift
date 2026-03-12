@@ -22,7 +22,7 @@ let package = Package(
             // so the build system can find the camera permission, etc.
             resources: [
                 .process("../Info.plist"),
-                .process("AppModule/yolo26n.mlpackage") //adding the model 
+                .process("AppModule/yolov8n.mlpackage") //adding the model 
             ]
         )
     ]
